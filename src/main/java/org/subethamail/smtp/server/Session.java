@@ -11,7 +11,6 @@ import java.net.SocketTimeoutException;
 import java.security.cert.Certificate;
 import java.util.Map;
 import java.util.Optional;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
@@ -20,6 +19,8 @@ import org.subethamail.smtp.DropConnectionException;
 import org.subethamail.smtp.MessageContext;
 import org.subethamail.smtp.MessageHandler;
 import org.subethamail.smtp.internal.io.CRLFTerminatedReader;
+import org.subethamail.smtp.internal.server.ServerThread;
+import org.subethamail.smtp.server.SessionHandler.SessionAcceptance;
 
 /**
  * The thread that handles a connection. This class passes most of it's
@@ -122,7 +123,11 @@ public final class Session implements Runnable, MessageContext {
      */
     @Override
     public void run() {
-        MDC.setContextMap(parentLoggingMdcContext);
+        // be defensive about setting with null because issue #13
+        // https://jira.qos.ch/browse/SLF4J-414
+        if (parentLoggingMdcContext != null) {
+            MDC.setContextMap(parentLoggingMdcContext);
+        }
         sessionId = server.getSessionIdFactory().create();
         MDC.put("SessionId", sessionId);
         final String originalName = Thread.currentThread().getName();
@@ -191,56 +196,68 @@ public final class Session implements Runnable, MessageContext {
             return;
         }
 
-        this.sendResponse(
-                "220 " + this.server.getHostName() + " ESMTP " + this.server.getSoftwareName());
+        final SessionAcceptance sresult = this.server.getSessionHandler().accept(this);
+        if (!sresult.accepted()) {
+            log.debug("SMTP " + sresult.errorMessage());
+            this.sendResponse(sresult.errorCode() + " " + sresult.errorMessage());
+            return;
+        }
 
-        while (!this.quitting) {
-            try {
-                String line = null;
+        try {
+            this.sendResponse(
+                    "220 " + this.server.getHostName() + " ESMTP " + this.server.getSoftwareName());
+
+            while (!this.quitting) {
                 try {
-                    line = this.reader.readLine();
-                } catch (SocketException ex) {
-                    // Lots of clients just "hang up" rather than issuing QUIT,
-                    // which would
-                    // fill our logs with the warning in the outer catch.
-                    if (log.isDebugEnabled())
-                        log.debug("Error reading client command: " + ex.getMessage(), ex);
+                    String line = null;
+                    try {
+                        line = this.reader.readLine();
+                    } catch (SocketException ex) {
+                        // Lots of clients just "hang up" rather than issuing QUIT,
+                        // which would
+                        // fill our logs with the warning in the outer catch.
+                        if (log.isDebugEnabled()) {
+                            log.debug("Error reading client command: " + ex.getMessage(), ex);
+                        }
 
+                        return;
+                    }
+
+                    if (line == null) {
+                        log.debug("no more lines from client");
+                        return;
+                    }
+
+                    log.debug("Client: {}", line);
+
+                    this.server.getCommandHandler().handleCommand(this, line);
+                } catch (DropConnectionException ex) {
+                    this.sendResponse(ex.getErrorResponse());
+                    return;
+                } catch (SocketTimeoutException ex) {
+                    this.sendResponse("421 Timeout waiting for data from client.");
+                    return;
+                } catch (CRLFTerminatedReader.TerminationException te) {
+                    String msg = "501 Syntax error at character position " + te.position()
+                            + ". CR and LF must be CRLF paired.  See RFC 2821 #2.7.1.";
+
+                    log.debug(msg);
+                    this.sendResponse(msg);
+
+                    // if people are screwing with things, close connection
+                    return;
+                } catch (CRLFTerminatedReader.MaxLineLengthException mlle) {
+                    String msg = "501 " + mlle.getMessage();
+
+                    log.debug(msg);
+                    this.sendResponse(msg);
+
+                    // if people are screwing with things, close connection
                     return;
                 }
-
-                if (line == null) {
-                    log.debug("no more lines from client");
-                    return;
-                }
-
-                log.debug("Client: {}", line);
-
-                this.server.getCommandHandler().handleCommand(this, line);
-            } catch (DropConnectionException ex) {
-                this.sendResponse(ex.getErrorResponse());
-                return;
-            } catch (SocketTimeoutException ex) {
-                this.sendResponse("421 Timeout waiting for data from client.");
-                return;
-            } catch (CRLFTerminatedReader.TerminationException te) {
-                String msg = "501 Syntax error at character position " + te.position()
-                        + ". CR and LF must be CRLF paired.  See RFC 2821 #2.7.1.";
-
-                log.debug(msg);
-                this.sendResponse(msg);
-
-                // if people are screwing with things, close connection
-                return;
-            } catch (CRLFTerminatedReader.MaxLineLengthException mlle) {
-                String msg = "501 " + mlle.getMessage();
-
-                log.debug(msg);
-                this.sendResponse(msg);
-
-                // if people are screwing with things, close connection
-                return;
             }
+        } finally {
+            this.server.getSessionHandler().onSessionEnd(this);
         }
     }
 
@@ -400,13 +417,14 @@ public final class Session implements Runnable, MessageContext {
 
     /**
      * Starts a mail transaction by creating a new message handler.
-     * 
+     *
      * @throws IllegalStateException
      *             if a mail transaction is already in progress
      */
     public void startMailTransaction() throws IllegalStateException {
-        if (this.messageHandler != null)
+        if (this.messageHandler != null) {
             throw new IllegalStateException("Mail transaction is already in progress");
+        }
         this.messageHandler = this.server.getMessageHandlerFactory().create(this);
     }
 
